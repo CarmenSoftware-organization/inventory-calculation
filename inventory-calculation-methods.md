@@ -285,14 +285,16 @@ function issueStock_AVG(productId, warehouseId, requiredQty):
 ```
 organization_settings (การตั้งค่าองค์กร):
   - org_id                (FK)
-  - costing_method        (enum: FIFO, AVERAGE)   -- วิธีคิดต้นทุน
+  - costing_method        (enum: FIFO, AVERAGE,
+                                  COST_LAYER_FIFO, COST_LAYER_AVERAGE)
   - allow_negative_stock  (boolean, default: false) -- อนุญาตสต๊อกติดลบ
   - decimal_precision     (integer, default: 4)     -- ความละเอียดทศนิยม
 
 -- หรือตั้งตามหมวดหมู่สินค้า:
 product_category (หมวดหมู่สินค้า):
   - category_id           (PK)
-  - costing_method        (enum: FIFO, AVERAGE)   -- วิธีคิดต้นทุน
+  - costing_method        (enum: FIFO, AVERAGE,
+                                  COST_LAYER_FIFO, COST_LAYER_AVERAGE)
 ```
 
 ### 6.2 รูปแบบสถาปัตยกรรม (Strategy Pattern)
@@ -301,6 +303,8 @@ product_category (หมวดหมู่สินค้า):
 interface InventoryCostingStrategy:
     receiveStock(productId, warehouseId, qty, cost)    // รับสินค้าเข้า
     issueStock(productId, warehouseId, qty) -> totalCost  // เบิกสินค้าออก
+    adjustStock(productId, warehouseId, qty, cost)     // ปรับปรุงสต๊อก
+    transferStock(from, to, qty)                       // โอนย้ายระหว่างคลัง
     getValuation(productId, warehouseId) -> value       // ดึงมูลค่าสินค้า
     recalculate(productId, warehouseId, fromDate)       // คำนวณใหม่
 
@@ -310,13 +314,15 @@ class FIFOStrategy implements InventoryCostingStrategy:
 class AverageCostStrategy implements InventoryCostingStrategy:
     // การประมวลผลแบบถัวเฉลี่ยถ่วงน้ำหนัก
 
+// ดู Section 8 สำหรับ CostLayerCostingStrategy ที่ขยายเพิ่มเติม
+
 class CostingService:
-    getStrategy(productId) -> InventoryCostingStrategy:
-        method = getConfiguredMethod(productId)
-        if method == FIFO:
-            return FIFOStrategy()
-        else:
-            return AverageCostStrategy()
+    getStrategy(method) -> InventoryCostingStrategy:
+        switch method:
+            FIFO               → FIFOStrategy
+            AVERAGE            → AverageCostStrategy
+            COST_LAYER_FIFO    → CostLayerFIFOStrategy
+            COST_LAYER_AVERAGE → CostLayerAverageStrategy
 ```
 
 ### 6.3 ขั้นตอนการประมวลผลรายการ
@@ -350,6 +356,8 @@ class CostingService:
 | **โอนย้ายระหว่างคลัง** | ย้ายเรคคอร์ดล็อต | เบิกออกด้วยต้นทุนเฉลี่ย รับเข้าด้วยต้นทุนเดียวกัน |
 | **สต๊อกติดลบ (ถ้าอนุญาต)** | ติดตามล็อตติดลบ | อนุญาตจำนวนติดลบ คงต้นทุนเฉลี่ย |
 | **การปัดเศษ** | ปัดเศษต่อล็อต | เสี่ยงสะสมคลาดเคลื่อน - ใช้ความละเอียดสูง |
+| **ใบลดหนี้ (Credit Note)** | ปรับล็อตเฉพาะ (Cost Layer) | ปรับล็อต + คำนวณค่าเฉลี่ยใหม่ (Cost Layer) |
+| **ปิด/เปิดงวดบัญชี** | snapshot ทุกล็อต + ยกยอด (Cost Layer) | snapshot ยอดรวม + ยกยอดล็อตเดียว (Cost Layer) |
 
 ### 6.5 การคำนวณใหม่และการแก้ไขข้อผิดพลาด
 
@@ -400,7 +408,199 @@ function recalculate(productId, warehouseId, fromDate):
 
 ---
 
-## 8. คำแนะนำ
+## 8. Cost Layer — ระบบต้นทุนแบบชั้นข้อมูล
+
+### 8.1 ภาพรวม
+
+Cost Layer เป็นส่วนขยายของ FIFO และต้นทุนถัวเฉลี่ยมาตรฐาน โดยเพิ่มความสามารถเพิ่มเติมสำหรับการจัดการระดับองค์กร:
+
+- **จัดการงวดบัญชี (Period Management)** — ปิด/เปิดงวดเพื่อตัดยอดสิ้นงวดและยกยอดข้ามงวด
+- **โอนย้ายระดับล็อต (Lot-level Transfer)** — รักษาต้นทุนแต่ละล็อตเมื่อโอนย้ายระหว่างคลัง (FIFO) หรือโอนที่ต้นทุนเฉลี่ย (Average)
+- **ใบลดหนี้ (Credit Note)** — ปรับปรุงล็อตเฉพาะเจาะจง
+- **ติดตามผลต่างการปัดเศษ (Rounding Diff)** — สะสมผลต่างจากการปัดเศษในแต่ละรายการ
+- **บันทึกรายการ (Transaction Log)** — audit trail เต็มรูปแบบพร้อม seq, period, parentLotId
+
+### 8.2 ประเภทรายการเพิ่มเติม
+
+| ประเภท | คำอธิบาย |
+|--------|---------|
+| `TRANSFER_OUT` | เบิกออกจากคลังต้นทาง (รักษาต้นทุนล็อตเดิม) |
+| `TRANSFER_IN` | รับเข้าคลังปลายทาง (สร้างล็อตใหม่ด้วยต้นทุนเดิม) |
+| `CREDIT_NOTE` | ปรับปรุงจำนวนในล็อตเฉพาะ (ใบลดหนี้) |
+| `CLOSE` | ปิดงวดบัญชี — ตัดยอดสินค้าคงเหลือทั้งหมด |
+| `OPEN` | เปิดงวดบัญชีใหม่ — ยกยอดจากงวดก่อน |
+
+### 8.3 โมเดลข้อมูล Cost Layer Transaction
+
+```
+cost_layer_transaction (รายการเคลื่อนไหวแบบ Cost Layer):
+  - id              (PK)
+  - type            (enum: IN, OUT, TRANSFER_OUT, TRANSFER_IN,
+                           CREDIT_NOTE, CLOSE, OPEN, ADJUST)
+  - lot_id          (FK, nullable)     -- ล็อตที่เกี่ยวข้อง
+  - in_qty          (decimal)          -- จำนวนรับเข้า
+  - out_qty         (decimal)          -- จำนวนเบิกออก
+  - unit_cost       (decimal)          -- ต้นทุนต่อหน่วย
+  - diff            (decimal)          -- ผลต่างการปัดเศษ
+  - avg_unit_cost   (decimal, nullable) -- ต้นทุนเฉลี่ย (เฉพาะ Average)
+  - date            (timestamp)
+  - location        (varchar)          -- รหัสคลังสินค้า
+  - seq             (integer)          -- ลำดับรายการภายในคลัง
+  - parent_lot_id   (FK, nullable)     -- ล็อตต้นทาง (สำหรับ issue/transfer)
+  - period          (varchar)          -- งวดบัญชี (YYYY-MM)
+  - reference_doc   (varchar, nullable)
+```
+
+### 8.4 Cost Layer FIFO
+
+ขยายจาก FIFO มาตรฐาน โดยเพิ่ม:
+
+#### การโอนย้ายแบบรักษาต้นทุนล็อต
+
+ต่างจาก FIFO มาตรฐานที่รวมต้นทุนเป็นค่าเดียว Cost Layer FIFO จะโอนย้าย **แต่ละล็อตแยกกัน** เพื่อรักษาต้นทุนเดิม:
+
+```
+ตัวอย่าง: โอนย้าย 20 หน่วยจาก MK ไปยัง KC
+
+ล็อตที่มีอยู่ใน MK:
+  - MK-01: 15 หน่วย @ ฿33.33
+  - MK-02: 10 หน่วย @ ฿33.34
+
+การโอนย้าย:
+  TRANSFER_OUT: MK-01, 15 หน่วย @ ฿33.33 (ใช้หมดล็อต)
+  TRANSFER_OUT: MK-02,  5 หน่วย @ ฿33.34 (ใช้บางส่วน)
+  TRANSFER_IN:  KC-01, 15 หน่วย @ ฿33.33 (ล็อตใหม่ ต้นทุนเดิม)
+  TRANSFER_IN:  KC-02,  5 หน่วย @ ฿33.34 (ล็อตใหม่ ต้นทุนเดิม)
+```
+
+#### ใบลดหนี้
+
+ปรับปรุงล็อตเฉพาะเจาะจงตาม `lotId`:
+
+```
+creditNote(lotId: "MK-02", quantity: 1, unitCost: ฿33.34)
+  → ลดจำนวนในล็อต MK-02 ลง 1 หน่วย
+  → บันทึกรายการ CREDIT_NOTE
+```
+
+#### การปิด/เปิดงวดบัญชี
+
+```
+ปิดงวด 2025-11:
+  1. บันทึก snapshot ของล็อตทั้งหมดในคลัง
+  2. สร้างรายการ CLOSE สำหรับแต่ละล็อต
+  3. ตัดยอดสินค้าคงเหลือเป็นศูนย์
+
+เปิดงวด 2025-12:
+  1. ดึง snapshot จากงวดที่ปิด
+  2. สร้างล็อตใหม่จาก snapshot (ต้นทุนเดิม)
+  3. สร้างรายการ OPEN สำหรับแต่ละล็อต
+```
+
+### 8.5 Cost Layer Average
+
+ขยายจากต้นทุนถัวเฉลี่ยมาตรฐาน โดยเพิ่ม:
+
+#### การติดตามผลต่างการปัดเศษ (Rounding Diff)
+
+ทุกครั้งที่คำนวณค่าเฉลี่ยใหม่ ผลต่างจากการปัดเศษจะถูกบันทึกและสะสม:
+
+```
+ตัวอย่าง:
+  รับเข้า 3 หน่วย @ ฿33.33  → avg = ฿33.33, diff = ฿0.01
+  รับเข้า 5 หน่วย @ ฿34.00  → avg = ฿33.7488, diff += ฿0.03
+
+  diff สะสม = ฿0.04 (รายงานเมื่อปิดงวด)
+```
+
+#### การโอนย้าย
+
+โอนย้ายที่ต้นทุนเฉลี่ยปัจจุบัน (ไม่แยกตามล็อต):
+
+```
+TRANSFER_OUT: 4 หน่วย @ ฿50.00 (avg cost)
+TRANSFER_IN:  4 หน่วย @ ฿50.00 (สร้างล็อตใหม่ที่ปลายทาง)
+```
+
+#### การปิด/เปิดงวดบัญชี
+
+```
+ปิดงวด:
+  1. บันทึกรายการ CLOSE รวมพร้อมผลต่างสะสม (diff)
+  2. ตัดยอดเป็นศูนย์
+
+เปิดงวด:
+  1. สร้างล็อตเดียวที่ต้นทุนเฉลี่ยของงวดที่ปิด
+  2. รีเซ็ตผลต่างสะสม (diff) เป็นศูนย์
+  3. บันทึกรายการ OPEN
+```
+
+### 8.6 ตัวอย่างจาก Excel (FIFO)
+
+สถานการณ์ซื้อสินค้า 30 หน่วย มูลค่ารวม ฿1,000 แบ่งเป็น 2 ล็อต:
+
+```
+ID    Type           Lot             In   Out   Per unit   Location   Period
+C001  Receiving      MK-251102-01    20    0    33.33      MK         2025-11
+C002  Receiving      MK-251102-02    10    0    33.34      MK         2025-11
+C003  Issue          -                0    5    33.33      BAR        2025-11
+C004  Transfer out   MK-251102-01     0   15    33.33      KC         2025-11
+C005  Transfer out   MK-251102-02     0    5    33.34      KC         2025-11
+C006  Transfer in    KC-251105-01    15    0    33.33      KC         2025-11
+C007  Transfer in    KC-251105-02     5    0    33.34      KC         2025-11
+C008  CN             MK-251102-01     0    1    33.34      MK         2025-11
+C009  CLOSE          MK-251102-02     0    4    33.34      MK         2025-11
+C010  CLOSE          KC-251105-01     0   15    33.33      KC         2025-11
+C011  CLOSE          KC-251105-02     0    5    33.34      KC         2025-11
+C012  OPEN           MK-251102-02     4    0    33.34      MK         2025-12
+C013  OPEN           KC-251105-01    15    0    33.33      KC         2025-12
+C014  OPEN           KC-251105-02     5    0    33.34      KC         2025-12
+```
+
+### 8.7 ตัวอย่างจาก Excel (Average)
+
+```
+ID    Type        Lot             In   Out   Per unit   Diff   AVG/unit   Location   Period
+C001  Receiving   MK-251102-01     3    0    33.33      0.01   33.33      MK         2025-11
+C003  Receiving   MK-251102-02     5    0    34.00      0.03   33.7488    MK         2025-11
+C004  Issue       -                0    4    33.7488*   -      33.7488    MK         2025-11
+C005  Receiving   MK-251104-01     6    0    35.00      -      34.50*     MK         2025-11
+C006  Issue       -                0    3    34.50*     -      34.50*     MK         2025-11
+C007  CLOSE       -                0    7    34.50*     0.23   34.50*     MK         2025-11
+C009  OPEN        MK-251201-01     7    0    34.50*     -      -          MK         2025-12
+
+(* = ต้นทุนเฉลี่ยที่คำนวณได้ อาจแตกต่างจาก Excel เล็กน้อยเนื่องจากการปัดเศษ)
+```
+
+### 8.8 สถาปัตยกรรม Strategy Pattern (ขยาย)
+
+```
+interface CostLayerCostingStrategy extends InventoryCostingStrategy:
+    transferStockCostLayer(input) -> CostLayerTransferResult
+    creditNote(input) -> CreditNoteResult
+    closePeriod(input) -> ClosePeriodResult
+    openPeriod(input) -> OpenPeriodResult
+    getTransactionLog(productId, warehouseId) -> CostLayerTransaction[]
+    getAccumulatedDiff(productId, warehouseId) -> number
+
+class CostLayerFIFOStrategy implements CostLayerCostingStrategy:
+    // FIFO + lot-level transfer + credit note + period management
+
+class CostLayerAverageStrategy implements CostLayerCostingStrategy:
+    // Weighted Average + diff tracking + credit note + period management
+
+class CostingService:
+    getStrategy(method) -> InventoryCostingStrategy:
+        switch method:
+            FIFO              → FIFOStrategy
+            AVERAGE           → AverageCostStrategy
+            COST_LAYER_FIFO   → CostLayerFIFOStrategy
+            COST_LAYER_AVERAGE → CostLayerAverageStrategy
+```
+
+---
+
+## 9. คำแนะนำ
 
 | สถานการณ์ | วิธีที่แนะนำ |
 |-----------|-------------|
@@ -410,15 +610,19 @@ function recalculate(productId, warehouseId, fromDate):
 | ค้าปลีกปริมาณสูง | **ต้นทุนถัวเฉลี่ย** (ประสิทธิภาพ ความเรียบง่าย) |
 | การผลิตด้วยวัตถุดิบ | **ต้นทุนถัวเฉลี่ย** (วัตถุดิบผสมรวมกัน) |
 | อิเล็กทรอนิกส์ / สินค้าที่มีหมายเลขซีเรียล | **FIFO** (ต้องติดตามซีเรียล/แบตช์) |
-| องค์กรที่ใช้หลายวิธี | **รองรับทั้งสองวิธี** ตั้งค่าตามหมวดหมู่ |
+| โอนย้ายข้ามคลังบ่อย + ต้องรักษาต้นทุนล็อต | **Cost Layer FIFO** (โอนย้ายระดับล็อต) |
+| ต้องจัดการงวดบัญชี + ใบลดหนี้ | **Cost Layer FIFO/Average** (ปิด/เปิดงวด, CN) |
+| ต้องการ audit trail ละเอียด + ติดตามผลต่างปัดเศษ | **Cost Layer Average** (diff tracking) |
+| องค์กรที่ใช้หลายวิธี | **รองรับทั้ง 4 วิธี** ตั้งค่าตามหมวดหมู่ |
 
 ### คำแนะนำสุดท้ายสำหรับแพลตฟอร์ม
 
-**รองรับทั้งสองวิธี** ด้วยแนวทาง Strategy Pattern ซึ่งให้ประโยชน์ดังนี้:
+**รองรับทั้ง 4 วิธี** ด้วยแนวทาง Strategy Pattern ซึ่งให้ประโยชน์ดังนี้:
 
 1. **ความยืดหยุ่น** - หมวดหมู่สินค้าต่างๆ สามารถใช้วิธีที่แตกต่างกันได้
 2. **การปฏิบัติตามกฎระเบียบ** - ตอบโจทย์ข้อกำหนดในหลากหลายอุตสาหกรรมและมาตรฐานบัญชี
 3. **เส้นทางการเปลี่ยนผ่าน** - องค์กรสามารถเปลี่ยนวิธีได้ ณ ขอบเขตของรอบบัญชี
 4. **ความได้เปรียบทางการแข่งขัน** - ดึงดูดตลาดได้กว้างกว่าแพลตฟอร์มที่รองรับวิธีเดียว
+5. **รองรับงวดบัญชี** - Cost Layer strategies รองรับการปิด/เปิดงวดพร้อม audit trail
 
-เริ่มต้นด้วย **ต้นทุนถัวเฉลี่ย** เป็นค่าเริ่มต้น (ง่ายกว่าในการพัฒนาและทดสอบ) จากนั้นเพิ่มการรองรับ **FIFO** ทั้งสองวิธีใช้โครงสร้างตารางรายการเดียวกัน แตกต่างกันเพียงวิธีการคำนวณและจัดเก็บต้นทุน
+เริ่มต้นด้วย **ต้นทุนถัวเฉลี่ย** เป็นค่าเริ่มต้น (ง่ายกว่าในการพัฒนาและทดสอบ) จากนั้นเพิ่มการรองรับ **FIFO** สำหรับองค์กรที่ต้องการจัดการงวดบัญชีและ audit trail เต็มรูปแบบ ให้ใช้ **Cost Layer FIFO** หรือ **Cost Layer Average** ทั้ง 4 วิธีใช้โครงสร้างตารางรายการเดียวกัน แตกต่างกันเพียงวิธีการคำนวณและจัดเก็บต้นทุน
