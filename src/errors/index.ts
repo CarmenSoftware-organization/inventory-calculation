@@ -1,3 +1,19 @@
+export class PeriodNotClosedError extends Error {
+  public readonly productId: string;
+  public readonly warehouseId: string;
+  public readonly period: string;
+
+  constructor(productId: string, warehouseId: string, period: string) {
+    super(
+      `Period "${period}" has not been closed for product "${productId}" in warehouse "${warehouseId}"`
+    );
+    this.name = "PeriodNotClosedError";
+    this.productId = productId;
+    this.warehouseId = warehouseId;
+    this.period = period;
+  }
+}
+
 export class InsufficientStockError extends Error {
   public readonly productId: string;
   public readonly warehouseId: string;

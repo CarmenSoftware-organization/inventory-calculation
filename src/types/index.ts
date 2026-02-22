@@ -3,11 +3,18 @@ export enum TransactionType {
   OUT = "OUT",
   ADJUST = "ADJUST",
   TRANSFER = "TRANSFER",
+  TRANSFER_OUT = "TRANSFER_OUT",
+  TRANSFER_IN = "TRANSFER_IN",
+  CREDIT_NOTE = "CREDIT_NOTE",
+  CLOSE = "CLOSE",
+  OPEN = "OPEN",
 }
 
 export enum CostingMethod {
   FIFO = "FIFO",
   AVERAGE = "AVERAGE",
+  COST_LAYER_FIFO = "COST_LAYER_FIFO",
+  COST_LAYER_AVERAGE = "COST_LAYER_AVERAGE",
 }
 
 export interface InventoryLot {
@@ -141,6 +148,79 @@ export interface RecalculateResultTransaction {
 export interface RecalculateResult {
   transactions: RecalculateResultTransaction[];
   finalBalance: {
+    quantity: number;
+    totalValue: number;
+    averageCost: number;
+  };
+}
+
+// Cost Layer types
+
+export interface CostLayerTransaction {
+  id: string;
+  type: TransactionType;
+  lotId?: string;
+  inQty: number;
+  outQty: number;
+  unitCost: number;
+  diff: number;
+  avgUnitCost?: number;
+  date: Date;
+  location: string;
+  seq: number;
+  parentLotId?: string;
+  period: string;
+  referenceDoc?: string;
+}
+
+export interface CreditNoteInput {
+  productId: string;
+  warehouseId: string;
+  lotId: string;
+  quantity: number;
+  unitCost: number;
+  referenceDoc?: string;
+  date?: Date;
+}
+
+export interface ClosePeriodInput {
+  productId: string;
+  warehouseId: string;
+  period: string;
+  date?: Date;
+}
+
+export interface OpenPeriodInput {
+  productId: string;
+  warehouseId: string;
+  period: string;
+  date?: Date;
+}
+
+export interface CreditNoteResult {
+  transaction: CostLayerTransaction;
+  balance: { quantity: number; totalValue: number; averageCost?: number };
+}
+
+export interface CostLayerTransferResult {
+  transferOutTransactions: CostLayerTransaction[];
+  transferInTransactions: CostLayerTransaction[];
+  totalTransferCost: number;
+}
+
+export interface ClosePeriodResult {
+  closeTransactions: CostLayerTransaction[];
+  closingBalance: {
+    quantity: number;
+    totalValue: number;
+    averageCost: number;
+    diff: number;
+  };
+}
+
+export interface OpenPeriodResult {
+  openTransactions: CostLayerTransaction[];
+  openingBalance: {
     quantity: number;
     totalValue: number;
     averageCost: number;
