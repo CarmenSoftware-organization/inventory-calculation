@@ -9,3 +9,12 @@ export { AverageCostStrategy } from "./strategies/average-cost-strategy";
 export { CostLayerFIFOStrategy } from "./strategies/cost-layer-fifo-strategy";
 export { CostLayerAverageStrategy } from "./strategies/cost-layer-average-strategy";
 export { CostingService } from "./services/costing-service";
+export { FIFOInventoryEngine } from "./engine/fifo";
+export type {
+  EngineTransaction,
+  EngineTransactionType,
+  LotRecord,
+  FIFOAllocation as EngineFIFOAllocation,
+  FIFOResult as EngineFIFOResult,
+  ValidationResult as EngineValidationResult,
+} from "./engine/fifo";

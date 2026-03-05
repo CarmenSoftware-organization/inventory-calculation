@@ -12,8 +12,9 @@
 
 ## โครงสร้างไฟล์
 
-- `inventory-calculation-methods.md` - เอกสารหลักเปรียบเทียบวิธีคำนวณต้นทุนทั้งหมด (ภาษาไทย)
-- `excel/inventory calculation CARMEN.xlsx` - ไฟล์ Excel ตัวอย่างสถานการณ์การคำนวณ Cost Layer (FIFO และ Avg)
+- `inventory-calculation-fifo.md` - เอกสาร FIFO + Cost Layer FIFO (ภาษาไทย)
+- `inventory-calculation-average.md` - เอกสาร ต้นทุนถัวเฉลี่ย + Cost Layer Average (ภาษาไทย)
+- `inventory-calculation-methods.md` - เอกสารรวมเปรียบเทียบวิธีคำนวณต้นทุนทั้งหมด (ภาษาไทย)
 
 ## โปรเจกต์ที่เกี่ยวข้อง
 

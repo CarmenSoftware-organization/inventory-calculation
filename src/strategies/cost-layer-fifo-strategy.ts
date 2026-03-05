@@ -28,9 +28,18 @@ import { InsufficientStockError, PeriodNotClosedError } from "../errors";
 import { round } from "../utils/rounding";
 import { derivePeriod } from "../utils/period";
 import { CostLayerCostingStrategy } from "./cost-layer-strategy";
+import { FIFOInventoryEngine } from "../engine/fifo";
+import type { EngineTransaction, LotRecord } from "../engine/fifo";
 
 function lotKey(productId: string, warehouseId: string): string {
   return `${productId}::${warehouseId}`;
+}
+
+function formatDate(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
 }
 
 interface ClosedPeriodSnapshot {
@@ -40,38 +49,22 @@ interface ClosedPeriodSnapshot {
 }
 
 export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
-  private lots = new Map<string, InventoryLot[]>();
-  private transactionLog = new Map<string, CostLayerTransaction[]>();
+  private engine = new FIFOInventoryEngine();
   private seqCounters = new Map<string, number>();
   private closedPeriods = new Map<string, ClosedPeriodSnapshot>();
   private accumulatedDiff = new Map<string, number>();
   private txnCounter = 0;
   private lotCounter = 0;
+  private transactionLog = new Map<string, CostLayerTransaction[]>();
 
-  private getOrCreateLots(
-    productId: string,
-    warehouseId: string
-  ): InventoryLot[] {
-    const key = lotKey(productId, warehouseId);
-    let lotList = this.lots.get(key);
-    if (!lotList) {
-      lotList = [];
-      this.lots.set(key, lotList);
-    }
-    return lotList;
-  }
+  // Track inputs for recalculate/replay
+  private processedInputs: Array<{
+    method: string;
+    input: any;
+  }> = [];
 
-  private getOrCreateLog(
-    productId: string,
-    warehouseId: string
-  ): CostLayerTransaction[] {
-    const key = lotKey(productId, warehouseId);
-    let log = this.transactionLog.get(key);
-    if (!log) {
-      log = [];
-      this.transactionLog.set(key, log);
-    }
-    return log;
+  getEngine(): FIFOInventoryEngine {
+    return this.engine;
   }
 
   private nextSeq(productId: string, warehouseId: string): number {
@@ -90,16 +83,32 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     return `lot-${++this.lotCounter}`;
   }
 
+  private getOrCreateLog(
+    productId: string,
+    warehouseId: string
+  ): CostLayerTransaction[] {
+    const key = lotKey(productId, warehouseId);
+    let log = this.transactionLog.get(key);
+    if (!log) {
+      log = [];
+      this.transactionLog.set(key, log);
+    }
+    return log;
+  }
+
   private availableQty(productId: string, warehouseId: string): number {
-    const lotList = this.getOrCreateLots(productId, warehouseId);
-    return lotList.reduce((sum, lot) => sum + lot.quantity, 0);
+    return this.engine.getQuantityByProductAndLocation(
+      productId,
+      warehouseId
+    );
   }
 
   private totalValue(productId: string, warehouseId: string): number {
-    const lotList = this.getOrCreateLots(productId, warehouseId);
-    return round(
-      lotList.reduce((sum, lot) => sum + lot.quantity * lot.unitCost, 0)
+    const lots = this.engine.getLotsByProductAndLocation(
+      productId,
+      warehouseId
     );
+    return round(lots.reduce((sum, l) => sum + l.quantity * l.unitCost, 0));
   }
 
   private makeTransaction(
@@ -126,89 +135,30 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     };
   }
 
-  private consumeLots(
-    productId: string,
-    warehouseId: string,
-    requiredQty: number
-  ): {
-    totalCost: number;
-    lotDetails: InventoryTransactionLot[];
-    consumedLots: Array<{ lotId: string; quantity: number; unitCost: number }>;
-    txnId: string;
-  } {
-    const lotList = this.getOrCreateLots(productId, warehouseId);
-    const available = this.availableQty(productId, warehouseId);
-
-    if (available < requiredQty) {
-      throw new InsufficientStockError(
-        productId,
-        warehouseId,
-        requiredQty,
-        available
-      );
-    }
-
-    const txnId = this.nextTxnId();
-    let totalCost = 0;
-    let remaining = requiredQty;
-    const lotDetails: InventoryTransactionLot[] = [];
-    const consumedLots: Array<{
-      lotId: string;
-      quantity: number;
-      unitCost: number;
-    }> = [];
-
-    for (const lot of lotList) {
-      if (remaining <= 0) break;
-      if (lot.quantity <= 0) continue;
-
-      const consume = Math.min(lot.quantity, remaining);
-      totalCost += consume * lot.unitCost;
-      lot.quantity = round(lot.quantity - consume);
-      remaining = round(remaining - consume);
-
-      lotDetails.push({
-        transactionId: txnId,
-        lotId: lot.lotId,
-        quantity: consume,
-        unitCost: lot.unitCost,
-      });
-
-      consumedLots.push({
-        lotId: lot.lotId,
-        quantity: consume,
-        unitCost: lot.unitCost,
-      });
-    }
-
-    // Remove fully consumed lots
-    const key = lotKey(productId, warehouseId);
-    this.lots.set(
-      key,
-      lotList.filter((l) => l.quantity > 0)
-    );
-
-    return { totalCost: round(totalCost), lotDetails, consumedLots, txnId };
-  }
-
   receiveStock(input: ReceiveStockInput): ReceiveResult {
-    const lotList = this.getOrCreateLots(input.productId, input.warehouseId);
     const lotId = this.nextLotId();
     const purchaseDate = input.date ?? new Date();
+    const dateStr = formatDate(purchaseDate);
+    const txnId = this.nextTxnId();
+    const seq = this.nextSeq(input.productId, input.warehouseId);
 
-    const newLot: InventoryLot = {
-      lotId,
+    const engineTx: EngineTransaction = {
+      id: txnId,
+      type: "Receiving",
       productId: input.productId,
-      warehouseId: input.warehouseId,
-      purchaseDate,
-      quantity: input.quantity,
+      lot: lotId,
+      in: input.quantity,
+      out: null,
       unitCost: input.unitCost,
+      date: dateStr,
+      location: input.warehouseId,
+      seq,
+      parentLot: null,
+      period: derivePeriod(purchaseDate),
     };
 
-    lotList.push(newLot);
-    lotList.sort((a, b) => a.purchaseDate.getTime() - b.purchaseDate.getTime());
+    this.engine.process(engineTx);
 
-    const txnId = this.nextTxnId();
     const txn = this.makeTransaction(
       txnId,
       input.productId,
@@ -228,7 +178,6 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       unitCost: input.unitCost,
     };
 
-    // Record cost layer transaction
     const period = derivePeriod(purchaseDate);
     const log = this.getOrCreateLog(input.productId, input.warehouseId);
     log.push({
@@ -241,7 +190,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       diff: 0,
       date: purchaseDate,
       location: input.warehouseId,
-      seq: this.nextSeq(input.productId, input.warehouseId),
+      seq,
       period,
       referenceDoc: input.referenceDoc,
     });
@@ -252,20 +201,64 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     return {
       transaction: txn,
       lotDetails: [lotDetail],
-      balance: {
-        quantity: qty,
-        totalValue: val,
-      },
+      balance: { quantity: qty, totalValue: val },
     };
   }
 
   issueStock(input: IssueStockInput): IssueResult {
-    const { totalCost, lotDetails, consumedLots, txnId } = this.consumeLots(
+    const available = this.availableQty(input.productId, input.warehouseId);
+    if (available < input.quantity) {
+      throw new InsufficientStockError(
+        input.productId,
+        input.warehouseId,
+        input.quantity,
+        available
+      );
+    }
+
+    const txnId = this.nextTxnId();
+    const issueDate = input.date ?? new Date();
+    const dateStr = formatDate(issueDate);
+    const period = derivePeriod(issueDate);
+
+    // Get lots before consumption for FIFO allocation
+    const lotsBefore = this.engine.getLotsByProductAndLocation(
       input.productId,
-      input.warehouseId,
-      input.quantity
+      input.warehouseId
     );
 
+    // Build an Issue transaction for the engine (FIFO deduction)
+    const seq = this.nextSeq(input.productId, input.warehouseId);
+    const engineTx: EngineTransaction = {
+      id: txnId,
+      type: "Issue",
+      productId: input.productId,
+      lot: null,
+      in: null,
+      out: input.quantity,
+      unitCost: 0,
+      date: dateStr,
+      location: input.warehouseId,
+      seq,
+      parentLot: null,
+      period,
+    };
+
+    const result = this.engine.process(engineTx);
+
+    // Build lot details from allocations
+    const lotDetails: InventoryTransactionLot[] = result.allocations.map(
+      (a) => ({
+        transactionId: txnId,
+        lotId: a.lot,
+        quantity: a.quantity,
+        unitCost: a.unitCost,
+      })
+    );
+
+    const totalCost = round(
+      result.allocations.reduce((s, a) => s + a.totalCost, 0)
+    );
     const avgUnitCost =
       input.quantity > 0 ? round(totalCost / input.quantity) : 0;
 
@@ -282,23 +275,20 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     );
 
     // Record per-lot cost layer transactions
-    const date = input.date ?? new Date();
-    const period = derivePeriod(date);
     const log = this.getOrCreateLog(input.productId, input.warehouseId);
-
-    for (const consumed of consumedLots) {
+    for (const alloc of result.allocations) {
       log.push({
         id: txnId,
         type: TransactionType.OUT,
         lotId: undefined,
         inQty: 0,
-        outQty: consumed.quantity,
-        unitCost: consumed.unitCost,
+        outQty: alloc.quantity,
+        unitCost: alloc.unitCost,
         diff: 0,
-        date,
+        date: issueDate,
         location: input.warehouseId,
         seq: this.nextSeq(input.productId, input.warehouseId),
-        parentLotId: consumed.lotId,
+        parentLotId: alloc.lot,
         period,
         referenceDoc: input.referenceDoc,
       });
@@ -311,10 +301,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       transaction: txn,
       lotDetails,
       totalCost,
-      balance: {
-        quantity: qty,
-        totalValue: val,
-      },
+      balance: { quantity: qty, totalValue: val },
     };
   }
 
@@ -324,23 +311,29 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
 
     if (input.quantity > 0) {
       const lotId = this.nextLotId();
-      const lotList = this.getOrCreateLots(input.productId, input.warehouseId);
       const adjustDate = input.date ?? new Date();
-
-      lotList.push({
-        lotId,
-        productId: input.productId,
-        warehouseId: input.warehouseId,
-        purchaseDate: adjustDate,
-        quantity: input.quantity,
-        unitCost: input.unitCost,
-      });
-
-      lotList.sort(
-        (a, b) => a.purchaseDate.getTime() - b.purchaseDate.getTime()
-      );
+      const dateStr = formatDate(adjustDate);
+      const seq = this.nextSeq(input.productId, input.warehouseId);
 
       txnId = this.nextTxnId();
+
+      const engineTx: EngineTransaction = {
+        id: txnId,
+        type: "Receiving",
+        productId: input.productId,
+        lot: lotId,
+        in: input.quantity,
+        out: null,
+        unitCost: input.unitCost,
+        date: dateStr,
+        location: input.warehouseId,
+        seq,
+        parentLot: null,
+        period: derivePeriod(adjustDate),
+      };
+
+      this.engine.process(engineTx);
+
       lotDetails = [
         {
           transactionId: txnId,
@@ -362,36 +355,66 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
         diff: 0,
         date: adjustDate,
         location: input.warehouseId,
-        seq: this.nextSeq(input.productId, input.warehouseId),
+        seq,
         period,
         referenceDoc: input.referenceDoc,
       });
     } else {
       const removeQty = Math.abs(input.quantity);
-      const consumed = this.consumeLots(
-        input.productId,
-        input.warehouseId,
-        removeQty
-      );
-      txnId = consumed.txnId;
-      lotDetails = consumed.lotDetails;
+      const available = this.availableQty(input.productId, input.warehouseId);
+      if (available < removeQty) {
+        throw new InsufficientStockError(
+          input.productId,
+          input.warehouseId,
+          removeQty,
+          available
+        );
+      }
 
+      txnId = this.nextTxnId();
       const adjustDate = input.date ?? new Date();
+      const dateStr = formatDate(adjustDate);
       const period = derivePeriod(adjustDate);
+      const seq = this.nextSeq(input.productId, input.warehouseId);
+
+      const engineTx: EngineTransaction = {
+        id: txnId,
+        type: "Issue",
+        productId: input.productId,
+        lot: null,
+        in: null,
+        out: removeQty,
+        unitCost: 0,
+        date: dateStr,
+        location: input.warehouseId,
+        seq,
+        parentLot: null,
+        period,
+      };
+
+      const result = this.engine.process(engineTx);
+
+      lotDetails = result.allocations.map((a) => ({
+        transactionId: txnId,
+        lotId: a.lot,
+        quantity: a.quantity,
+        unitCost: a.unitCost,
+      }));
+
       const log = this.getOrCreateLog(input.productId, input.warehouseId);
-      for (const c of consumed.consumedLots) {
+      for (const alloc of result.allocations) {
         log.push({
           id: txnId,
           type: TransactionType.ADJUST,
           lotId: undefined,
           inQty: 0,
-          outQty: c.quantity,
-          unitCost: c.unitCost,
+          outQty: alloc.quantity,
+          unitCost: alloc.unitCost,
           diff: 0,
           date: adjustDate,
           location: input.warehouseId,
           seq: this.nextSeq(input.productId, input.warehouseId),
-          parentLotId: c.lotId,
+          parentLotId: alloc.lot,
           period,
           referenceDoc: input.referenceDoc,
         });
@@ -416,10 +439,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     return {
       transaction: txn,
       lotDetails,
-      balance: {
-        quantity: qty,
-        totalValue: val,
-      },
+      balance: { quantity: qty, totalValue: val },
     };
   }
 
@@ -434,12 +454,18 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       );
     }
 
-    const lotList = this.getOrCreateLots(
+    const transferDate = input.date ?? new Date();
+    const dateStr = formatDate(transferDate);
+    const period = derivePeriod(transferDate);
+
+    // Get source lots for per-lot transfer (FIFO order)
+    const sourceLots = this.engine.getLotsByProductAndLocation(
       input.productId,
       input.fromWarehouseId
     );
-    const transferDate = input.date ?? new Date();
-    const period = derivePeriod(transferDate);
+    sourceLots.sort(
+      (a, b) => a.seq - b.seq || a.createdAt.localeCompare(b.createdAt)
+    );
 
     let remaining = input.quantity;
     let totalTransferCost = 0;
@@ -451,47 +477,58 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       unitCost: number;
     }> = [];
 
-    // Consume lots FIFO from source
-    for (const lot of lotList) {
+    // Calculate what will be consumed FIFO
+    for (const lot of sourceLots) {
       if (remaining <= 0) break;
       if (lot.quantity <= 0) continue;
 
       const consume = Math.min(lot.quantity, remaining);
-      lot.quantity = round(lot.quantity - consume);
       remaining = round(remaining - consume);
       totalTransferCost += consume * lot.unitCost;
 
       consumedEntries.push({
-        lotId: lot.lotId,
+        lotId: lot.lot,
         quantity: consume,
         unitCost: lot.unitCost,
       });
     }
 
-    // Remove fully consumed lots from source
-    const sourceKey = lotKey(input.productId, input.fromWarehouseId);
-    this.lots.set(
-      sourceKey,
-      lotList.filter((l) => l.quantity > 0)
-    );
-
     totalTransferCost = round(totalTransferCost);
 
-    // Create per-lot TRANSFER_OUT and TRANSFER_IN pairs
+    // Process per-lot TransferOut/TransferIn via engine
     const sourceLog = this.getOrCreateLog(
       input.productId,
       input.fromWarehouseId
     );
-    const destLog = this.getOrCreateLog(input.productId, input.toWarehouseId);
-    const destLotList = this.getOrCreateLots(
+    const destLog = this.getOrCreateLog(
       input.productId,
       input.toWarehouseId
     );
 
     for (const entry of consumedEntries) {
-      // TRANSFER_OUT at source
+      const outTxnId = this.nextTxnId();
+      const outSeq = this.nextSeq(input.productId, input.fromWarehouseId);
+
+      // TransferOut via engine
+      const outEngineTx: EngineTransaction = {
+        id: outTxnId,
+        type: "TransferOut",
+        productId: input.productId,
+        lot: entry.lotId,
+        in: null,
+        out: entry.quantity,
+        unitCost: entry.unitCost,
+        date: dateStr,
+        location: input.fromWarehouseId,
+        seq: outSeq,
+        parentLot: entry.lotId,
+        period,
+      };
+
+      this.engine.process(outEngineTx);
+
       const outTxn: CostLayerTransaction = {
-        id: this.nextTxnId(),
+        id: outTxnId,
         type: TransactionType.TRANSFER_OUT,
         lotId: entry.lotId,
         inQty: 0,
@@ -500,7 +537,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
         diff: 0,
         date: transferDate,
         location: input.fromWarehouseId,
-        seq: this.nextSeq(input.productId, input.fromWarehouseId),
+        seq: outSeq,
         parentLotId: entry.lotId,
         period,
         referenceDoc: input.referenceDoc,
@@ -508,20 +545,30 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       sourceLog.push(outTxn);
       transferOutTransactions.push(outTxn);
 
-      // Create new lot at destination preserving cost
+      // TransferIn via engine
       const newLotId = this.nextLotId();
-      destLotList.push({
-        lotId: newLotId,
-        productId: input.productId,
-        warehouseId: input.toWarehouseId,
-        purchaseDate: transferDate,
-        quantity: entry.quantity,
-        unitCost: entry.unitCost,
-      });
+      const inTxnId = this.nextTxnId();
+      const inSeq = this.nextSeq(input.productId, input.toWarehouseId);
 
-      // TRANSFER_IN at destination
+      const inEngineTx: EngineTransaction = {
+        id: inTxnId,
+        type: "TransferIn",
+        productId: input.productId,
+        lot: newLotId,
+        in: entry.quantity,
+        out: null,
+        unitCost: entry.unitCost,
+        date: dateStr,
+        location: input.toWarehouseId,
+        seq: inSeq,
+        parentLot: null,
+        period,
+      };
+
+      this.engine.process(inEngineTx);
+
       const inTxn: CostLayerTransaction = {
-        id: this.nextTxnId(),
+        id: inTxnId,
         type: TransactionType.TRANSFER_IN,
         lotId: newLotId,
         inQty: entry.quantity,
@@ -530,17 +577,13 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
         diff: 0,
         date: transferDate,
         location: input.toWarehouseId,
-        seq: this.nextSeq(input.productId, input.toWarehouseId),
+        seq: inSeq,
         period,
         referenceDoc: input.referenceDoc,
       };
       destLog.push(inTxn);
       transferInTransactions.push(inTxn);
     }
-
-    destLotList.sort(
-      (a, b) => a.purchaseDate.getTime() - b.purchaseDate.getTime()
-    );
 
     return {
       transferOutTransactions,
@@ -592,8 +635,12 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
   }
 
   creditNote(input: CreditNoteInput): CreditNoteResult {
-    const lotList = this.getOrCreateLots(input.productId, input.warehouseId);
-    const lot = lotList.find((l) => l.lotId === input.lotId);
+    // Find the lot in the engine
+    const lots = this.engine.getLotsByProductAndLocation(
+      input.productId,
+      input.warehouseId
+    );
+    const lot = lots.find((l) => l.lot === input.lotId);
 
     if (!lot) {
       throw new Error(
@@ -610,18 +657,28 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       );
     }
 
-    lot.quantity = round(lot.quantity - input.quantity);
-
-    // Remove fully consumed lots
-    const key = lotKey(input.productId, input.warehouseId);
-    this.lots.set(
-      key,
-      lotList.filter((l) => l.quantity > 0)
-    );
-
     const date = input.date ?? new Date();
+    const dateStr = formatDate(date);
     const period = derivePeriod(date);
     const txnId = this.nextTxnId();
+    const seq = this.nextSeq(input.productId, input.warehouseId);
+
+    const engineTx: EngineTransaction = {
+      id: txnId,
+      type: "CreditNote",
+      productId: input.productId,
+      lot: null,
+      in: null,
+      out: input.quantity,
+      unitCost: input.unitCost,
+      date: dateStr,
+      location: input.warehouseId,
+      seq,
+      parentLot: input.lotId,
+      period,
+    };
+
+    this.engine.process(engineTx);
 
     const log = this.getOrCreateLog(input.productId, input.warehouseId);
     const clTxn: CostLayerTransaction = {
@@ -634,7 +691,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       diff: 0,
       date,
       location: input.warehouseId,
-      seq: this.nextSeq(input.productId, input.warehouseId),
+      seq,
       period,
       referenceDoc: input.referenceDoc,
     };
@@ -645,26 +702,34 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
 
     return {
       transaction: clTxn,
-      balance: {
-        quantity: qty,
-        totalValue: val,
-      },
+      balance: { quantity: qty, totalValue: val },
     };
   }
 
   closePeriod(input: ClosePeriodInput): ClosePeriodResult {
-    const lotList = this.getOrCreateLots(input.productId, input.warehouseId);
     const key = lotKey(input.productId, input.warehouseId);
     const date = input.date ?? new Date();
+    const dateStr = formatDate(date);
 
-    // Snapshot current lots for this location
-    const snapshot: InventoryLot[] = lotList
-      .filter((l) => l.quantity > 0)
-      .map((l) => ({ ...l }));
+    // Get current lots from engine for this product/location
+    const currentLots = this.engine.getLotsByProductAndLocation(
+      input.productId,
+      input.warehouseId
+    );
+    const activeLots = currentLots.filter((l) => l.quantity > 0);
+
+    // Build snapshot for reopening
+    const snapshot: InventoryLot[] = activeLots.map((l) => ({
+      lotId: l.lot,
+      productId: l.productId,
+      warehouseId: input.warehouseId,
+      purchaseDate: new Date(l.createdAt),
+      quantity: l.quantity,
+      unitCost: l.unitCost,
+    }));
 
     const accDiff = this.accumulatedDiff.get(key) ?? 0;
 
-    // Store closed period snapshot
     const closedKey = `${key}::${input.period}`;
     this.closedPeriods.set(closedKey, {
       period: input.period,
@@ -675,20 +740,40 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     const closeTransactions: CostLayerTransaction[] = [];
     const log = this.getOrCreateLog(input.productId, input.warehouseId);
 
-    // Record CLOSE transaction for each lot
-    for (const lot of snapshot) {
+    // Close each lot via engine and record transactions
+    for (const lot of activeLots) {
+      const txnId = this.nextTxnId();
+      const seq = this.nextSeq(input.productId, input.warehouseId);
+
+      const engineTx: EngineTransaction = {
+        id: txnId,
+        type: "Close",
+        productId: input.productId,
+        lot: lot.lot,
+        in: null,
+        out: lot.quantity,
+        unitCost: lot.unitCost,
+        date: dateStr,
+        location: input.warehouseId,
+        seq,
+        parentLot: null,
+        period: input.period,
+      };
+
+      this.engine.process(engineTx);
+
       const clTxn: CostLayerTransaction = {
-        id: this.nextTxnId(),
+        id: txnId,
         type: TransactionType.CLOSE,
-        lotId: lot.lotId,
+        lotId: lot.lot,
         inQty: 0,
         outQty: lot.quantity,
         unitCost: lot.unitCost,
         diff: 0,
         date,
         location: input.warehouseId,
-        seq: this.nextSeq(input.productId, input.warehouseId),
-        parentLotId: lot.lotId,
+        seq,
+        parentLotId: lot.lot,
         period: input.period,
       };
       log.push(clTxn);
@@ -700,9 +785,6 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       snapshot.reduce((s, l) => s + l.quantity * l.unitCost, 0)
     );
     const closingAvg = closingQty > 0 ? round(closingValue / closingQty) : 0;
-
-    // Zero out lots at this location
-    this.lots.set(key, []);
 
     return {
       closeTransactions,
@@ -718,8 +800,6 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
   openPeriod(input: OpenPeriodInput): OpenPeriodResult {
     const key = lotKey(input.productId, input.warehouseId);
 
-    // Find the closed period snapshot — look for previous period
-    // We need to find a closed period to open from
     const closedKey = this.findClosedPeriodKey(
       input.productId,
       input.warehouseId
@@ -735,19 +815,34 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
 
     const snapshot = this.closedPeriods.get(closedKey)!;
     const date = input.date ?? new Date();
+    const dateStr = formatDate(date);
     const openTransactions: CostLayerTransaction[] = [];
     const log = this.getOrCreateLog(input.productId, input.warehouseId);
-    const lotList = this.getOrCreateLots(input.productId, input.warehouseId);
 
-    // Re-create lots from snapshot
+    // Re-create lots from snapshot via engine
     for (const lot of snapshot.lots) {
-      lotList.push({
-        ...lot,
-        warehouseId: input.warehouseId,
-      });
+      const txnId = this.nextTxnId();
+      const seq = this.nextSeq(input.productId, input.warehouseId);
+
+      const engineTx: EngineTransaction = {
+        id: txnId,
+        type: "Open",
+        productId: input.productId,
+        lot: lot.lotId,
+        in: lot.quantity,
+        out: null,
+        unitCost: lot.unitCost,
+        date: dateStr,
+        location: input.warehouseId,
+        seq,
+        parentLot: null,
+        period: input.period,
+      };
+
+      this.engine.process(engineTx);
 
       const clTxn: CostLayerTransaction = {
-        id: this.nextTxnId(),
+        id: txnId,
         type: TransactionType.OPEN,
         lotId: lot.lotId,
         inQty: lot.quantity,
@@ -756,7 +851,7 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
         diff: 0,
         date,
         location: input.warehouseId,
-        seq: this.nextSeq(input.productId, input.warehouseId),
+        seq,
         period: input.period,
       };
       log.push(clTxn);
@@ -809,9 +904,12 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
   }
 
   getValuation(productId: string, warehouseId: string): ValuationResult {
-    const lotList = this.getOrCreateLots(productId, warehouseId);
-    const qty = this.availableQty(productId, warehouseId);
-    const val = this.totalValue(productId, warehouseId);
+    const lots = this.engine.getLotsByProductAndLocation(
+      productId,
+      warehouseId
+    );
+    const qty = lots.reduce((s, l) => s + l.quantity, 0);
+    const val = round(lots.reduce((s, l) => s + l.quantity * l.unitCost, 0));
     const avgCost = qty > 0 ? round(val / qty) : 0;
 
     return {
@@ -820,7 +918,16 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       quantity: qty,
       totalValue: val,
       averageCost: avgCost,
-      lots: lotList.filter((l) => l.quantity > 0).map((l) => ({ ...l })),
+      lots: lots
+        .filter((l) => l.quantity > 0)
+        .map((l) => ({
+          lotId: l.lot,
+          productId: l.productId,
+          warehouseId,
+          purchaseDate: new Date(l.createdAt),
+          quantity: l.quantity,
+          unitCost: l.unitCost,
+        })),
     };
   }
 
@@ -829,28 +936,40 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
     warehouseId: string,
     transactions: RecalculateTransaction[]
   ): RecalculateResult {
-    const key = lotKey(productId, warehouseId);
-    this.lots.set(key, []);
+    // Create a fresh engine for replay
+    const freshEngine = new FIFOInventoryEngine();
 
     const sorted = [...transactions].sort(
       (a, b) => a.date.getTime() - b.date.getTime()
     );
 
     const results: RecalculateResultTransaction[] = [];
+    let lotSeq = 0;
+    let lotNum = 0;
 
     for (const txn of sorted) {
       if (txn.transactionType === TransactionType.IN) {
-        const lotList = this.getOrCreateLots(productId, warehouseId);
-        const lotId = this.nextLotId();
+        lotNum++;
+        lotSeq++;
+        const lotId = `recalc-lot-${lotNum}`;
+        const dateStr = formatDate(txn.date);
 
-        lotList.push({
-          lotId,
+        const engineTx: EngineTransaction = {
+          id: `recalc-${lotSeq}`,
+          type: "Receiving",
           productId,
-          warehouseId,
-          purchaseDate: txn.date,
-          quantity: txn.quantity,
+          lot: lotId,
+          in: txn.quantity,
+          out: null,
           unitCost: txn.unitCost,
-        });
+          date: dateStr,
+          location: warehouseId,
+          seq: lotSeq,
+          parentLot: null,
+          period: derivePeriod(txn.date),
+        };
+
+        freshEngine.process(engineTx);
 
         results.push({
           transactionType: TransactionType.IN,
@@ -861,12 +980,28 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
           referenceDoc: txn.referenceDoc,
         });
       } else {
-        const { totalCost } = this.consumeLots(
-          productId,
-          warehouseId,
-          txn.quantity
-        );
+        lotSeq++;
+        const dateStr = formatDate(txn.date);
 
+        const engineTx: EngineTransaction = {
+          id: `recalc-${lotSeq}`,
+          type: "Issue",
+          productId,
+          lot: null,
+          in: null,
+          out: txn.quantity,
+          unitCost: 0,
+          date: dateStr,
+          location: warehouseId,
+          seq: lotSeq,
+          parentLot: null,
+          period: derivePeriod(txn.date),
+        };
+
+        const engineResult = freshEngine.process(engineTx);
+        const totalCost = round(
+          engineResult.allocations.reduce((s, a) => s + a.totalCost, 0)
+        );
         const avgUnitCost =
           txn.quantity > 0 ? round(totalCost / txn.quantity) : 0;
 
@@ -881,8 +1016,14 @@ export class CostLayerFIFOStrategy implements CostLayerCostingStrategy {
       }
     }
 
-    const qty = this.availableQty(productId, warehouseId);
-    const val = this.totalValue(productId, warehouseId);
+    const remainingLots = freshEngine.getLotsByProductAndLocation(
+      productId,
+      warehouseId
+    );
+    const qty = remainingLots.reduce((s, l) => s + l.quantity, 0);
+    const val = round(
+      remainingLots.reduce((s, l) => s + l.quantity * l.unitCost, 0)
+    );
     const avgCost = qty > 0 ? round(val / qty) : 0;
 
     return {
